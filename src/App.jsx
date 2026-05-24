@@ -142,9 +142,183 @@ function normalize(value) {
   return clean(value).toLowerCase();
 }
 
+function firstValue(row, keys) {
+  for (const key of keys) {
+    const value = clean(row?.[key]);
+    if (value) return value;
+  }
+  return "";
+}
+
+function getPersonCode(row) {
+  return firstValue(row, [
+    "Code",
+    "NewCode",
+    "PersonCode",
+    "PersonID",
+    "ID",
+  ]);
+}
+
+function getPersonName(row) {
+  return firstValue(row, [
+    "DisplayName",
+    "Name",
+    "PersonName",
+    "FullName",
+    "الاسم",
+  ]);
+}
+
+function getFatherCode(row) {
+  return firstValue(row, [
+    "FatherCode",
+    "NewFatherCode",
+    "FatherID",
+    "Father",
+  ]);
+}
+
+function getMotherCode(row) {
+  return firstValue(row, [
+    "MotherCode",
+    "NewMotherCode",
+    "MotherID",
+    "Mother",
+  ]);
+}
+
+function getBranchName(row) {
+  return firstValue(row, [
+    "BranchName",
+    "Branch",
+    "MainBranch",
+    "Family",
+  ]);
+}
+
+function getPathText(row) {
+  return firstValue(row, [
+    "Path",
+    "PersonPath",
+    "Path_Names",
+    "NamesPath",
+  ]);
+}
+
+function buildAnsabIndex(database) {
+  const people =
+    database?.people ||
+    database?.sheets?.Dataset ||
+    database?.sheets?.["Tribe Members"] ||
+    [];
+
+  const media = database?.media || database?.sheets?.Media || [];
+
+  const peopleByCode = {};
+  const childrenByFatherCode = {};
+  const childrenByMotherCode = {};
+  const mediaByPersonCode = {};
+  const searchIndex = [];
+
+  people.forEach((person, rowIndex) => {
+    const code = getPersonCode(person);
+    if (!code) return;
+
+    peopleByCode[code] = person;
+
+    const fatherCode = getFatherCode(person);
+    const motherCode = getMotherCode(person);
+
+    if (fatherCode) {
+      if (!childrenByFatherCode[fatherCode]) childrenByFatherCode[fatherCode] = [];
+      childrenByFatherCode[fatherCode].push(person);
+    }
+
+    if (motherCode) {
+      if (!childrenByMotherCode[motherCode]) childrenByMotherCode[motherCode] = [];
+      childrenByMotherCode[motherCode].push(person);
+    }
+
+    const searchableText = [
+      code,
+      getPersonName(person),
+      firstValue(person, ["Name"]),
+      firstValue(person, ["DisplayName"]),
+      firstValue(person, ["PersonType"]),
+      getBranchName(person),
+      getPathText(person),
+      fatherCode,
+      motherCode,
+      firstValue(person, ["FatherName", "Father"]),
+      firstValue(person, ["MotherName", "Mother"]),
+    ]
+      .join(" ")
+      .toLowerCase();
+
+    searchIndex.push({
+      type: "person",
+      code,
+      title: getPersonName(person) || code,
+      subtitle: getBranchName(person) || getPathText(person) || code,
+      rowIndex,
+      searchableText,
+      person,
+    });
+  });
+
+  media.forEach((item) => {
+    const relatedCode = firstValue(item, [
+      "RelatedCode",
+      "RelatedPersonCode",
+      "PersonCode",
+      "Code",
+    ]);
+
+    if (!relatedCode) return;
+
+    if (!mediaByPersonCode[relatedCode]) mediaByPersonCode[relatedCode] = [];
+    mediaByPersonCode[relatedCode].push(item);
+  });
+
+  return {
+    people,
+    media,
+    peopleByCode,
+    childrenByFatherCode,
+    childrenByMotherCode,
+    mediaByPersonCode,
+    searchIndex,
+  };
+}
+
+function buildFatherPath(person, ansabIndex) {
+  const path = [];
+  const seen = new Set();
+
+  let current = person;
+
+  while (current) {
+    const code = getPersonCode(current);
+    if (!code || seen.has(code)) break;
+
+    seen.add(code);
+    path.push(current);
+
+    const fatherCode = getFatherCode(current);
+    if (!fatherCode) break;
+
+    current = ansabIndex.peopleByCode[fatherCode];
+  }
+
+  return path;
+}
+
+
 function findPage(pageId) {
   if (pageId === "home") return { type: "home" };
   if (pageId === "admin") return { type: "admin" };
+  if (pageId === "person") return { type: "person" };
   for (const section of sections) {
     if (section.id === pageId) return { type: "section", section };
     const child = section.children.find((item) => item.id === pageId);
@@ -256,6 +430,8 @@ export default function NiefrarPortalPrototype() {
   const [openSection, setOpenSection] = useState(null);
   const [database, setDatabase] = useState(null);
   const [dataStatus, setDataStatus] = useState("loading");
+  const [selectedPersonCode, setSelectedPersonCode] = useState("");
+  const ansabIndex = useMemo(() => buildAnsabIndex(database), [database]);
 
   useEffect(() => {
     let active = true;
@@ -277,45 +453,69 @@ export default function NiefrarPortalPrototype() {
 
   const current = findPage(page);
 
-  const searchResults = useMemo(() => {
-    const q = normalize(query);
-    if (!q) return [];
+const searchResults = useMemo(() => {
+  const q = normalize(query);
+  if (!q) return [];
 
-    const rows = [];
-    sections.forEach((section) => {
-      if (normalize(section.title).includes(q) || normalize(section.subtitle).includes(q)) {
-        rows.push({ id: section.id, title: section.title, meta: "قسم رئيسي", accent: section.accent });
+  const rows = [];
+
+  // 1. Search main homepage sections and sub-pages
+  sections.forEach((section) => {
+    if (
+      normalize(section.title).includes(q) ||
+      normalize(section.subtitle).includes(q)
+    ) {
+      rows.push({
+        id: section.id,
+        type: "page",
+        title: section.title,
+        meta: "قسم رئيسي",
+        accent: section.accent,
+      });
+    }
+
+    section.children.forEach((child) => {
+      if (
+        normalize(child.title).includes(q) ||
+        normalize(child.description).includes(q)
+      ) {
+        rows.push({
+          id: child.id,
+          type: "page",
+          title: child.title,
+          meta: section.title,
+          accent: section.accent,
+        });
       }
-      section.children.forEach((child) => {
-        if (normalize(child.title).includes(q) || normalize(child.description).includes(q)) {
-          rows.push({ id: child.id, title: child.title, meta: section.title, accent: section.accent });
-        }
+    });
+  });
+
+  // 2. Search people from Ansab dataset using the smart index
+  ansabIndex.searchIndex
+    .filter((item) => item.searchableText.includes(q))
+    .slice(0, 20)
+    .forEach((item) => {
+      rows.push({
+        id: "person",
+        type: "person",
+        code: item.code,
+        title: item.title,
+        meta: item.subtitle,
+        accent: "#006b5b",
       });
     });
 
-    const people = database?.people || database?.sheets?.Dataset || [];
-    people
-      .filter((person) => {
-        const haystack = [person.Name, person.DisplayName, person.Code, person.Path, person.Father, person.Mother].join(" ");
-        return normalize(haystack).includes(q);
-      })
-      .slice(0, 12)
-      .forEach((person) => {
-        rows.push({
-          id: "tree",
-          title: person.DisplayName || person.Name || person.Code,
-          meta: person.Code || "فرد من قاعدة البيانات",
-          accent: "#006b5b",
-        });
-      });
+  return rows.slice(0, 25);
+}, [query, ansabIndex]);
 
-    return rows.slice(0, 18);
-  }, [query, database]);
-
-  const navigate = (target) => {
-    setPage(target);
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
+  const navigate = (target, options = {}) => {
+  if (target === "person" && options.personCode) {
+    setSelectedPersonCode(options.personCode);
+  }
+  
+  setPage(target);
+  window.scrollTo({ top: 0, behavior: "smooth" });
+};
 
   return (
     <div dir="rtl" className="min-h-screen bg-[#f6efe5] text-[#173a36]">
@@ -364,10 +564,25 @@ export default function NiefrarPortalPrototype() {
             />
           ) : current.type === "admin" ? (
             <AdminPage navigate={navigate} onDataPublished={() => setDataStatus("ready")} />
+          ) : current.type === "person" ? (
+            <PersonProfilePage
+            code={selectedPersonCode}
+            ansabIndex={ansabIndex}
+            navigate={navigate}
+          />
           ) : current.type === "section" ? (
-            <SectionPage section={current.section} navigate={navigate} database={database} />
+            <SectionPage
+              section={current.section}
+              navigate={navigate}
+              ansabIndex={ansabIndex}
+            />
           ) : current.type === "child" ? (
-            <ChildPage section={current.section} child={current.child} navigate={navigate} database={database} />
+              <ChildPage
+              section={current.section}
+              child={current.child}
+              navigate={navigate}
+              ansabIndex={ansabIndex}
+            />
           ) : (
             <UtilityPage id={page} navigate={navigate} />
           )}
@@ -418,8 +633,12 @@ function HomePage({ query, setQuery, searchResults, navigate, openSection, setOp
           <div className="mt-4 space-y-2 border-t border-[#eee1cf] pt-3">
             {searchResults.map((item, index) => (
               <button
-                key={`${item.id}-${index}-${item.title}`}
-                onClick={() => navigate(item.id)}
+                key={`${item.type}-${item.code || item.id}-${index}`}
+                onClick={() =>
+                  item.type === "person"
+                    ? navigate("person", { personCode: item.code })
+                    : navigate(item.id)
+                }
                 className="flex w-full items-center justify-between rounded-2xl bg-[#fbf7f1] px-4 py-3 text-right transition hover:scale-[1.01]"
               >
                 <span>
@@ -574,7 +793,7 @@ function SectionCard({ section, isOpen, toggle, navigate }) {
   );
 }
 
-function SectionPage({ section, navigate, database }) {
+function SectionPage({ section, navigate, ansabIndex }) {
   const Icon = section.icon;
   return (
     <div className="space-y-5">
@@ -615,13 +834,20 @@ function SectionPage({ section, navigate, database }) {
         </div>
       </div>
 
-      {section.id === "ansab" && <DataPreview database={database} accent={section.accent} mode="people" />}
+      {section.id === "ansab" && (
+        <DataPreview
+          ansabIndex={ansabIndex}
+          accent={section.accent}
+          mode="people"
+          navigate={navigate}
+        />
+      )}
       <PrototypeNote accent={section.accent} />
     </div>
   );
 }
 
-function ChildPage({ section, child, navigate, database }) {
+function ChildPage({ section, child, navigate, ansabIndex }) {
   const Icon = child.icon;
   const showData = ["tree", "mothers"].includes(child.id);
 
@@ -649,7 +875,12 @@ function ChildPage({ section, child, navigate, database }) {
       </section>
 
       {showData ? (
-        <DataPreview database={database} accent={section.accent} mode={child.id === "mothers" ? "mothers" : "people"} />
+        <DataPreview
+          ansabIndex={ansabIndex}
+          accent={section.accent}
+          mode={child.id === "mothers" ? "mothers" : "people"}
+          navigate={navigate}
+        />
       ) : (
         <section className="rounded-[1.7rem] bg-white/85 p-4 shadow-lg shadow-[#a8865a]/10 ring-1 ring-black/5">
           <h2 className="mb-3 text-xl font-black text-[#173a36]">منطقة المحتوى التفاعلي</h2>
@@ -676,9 +907,9 @@ function ChildPage({ section, child, navigate, database }) {
   );
 }
 
-function DataPreview({ database, accent, mode }) {
+function DataPreview({ ansabIndex, accent, mode, navigate }) {
   const [q, setQ] = useState("");
-  const people = database?.people || database?.sheets?.Dataset || [];
+  const people = ansabIndex.people || [];
   const rows = useMemo(() => {
     const needle = normalize(q);
     return people
@@ -724,18 +955,241 @@ function DataPreview({ database, accent, mode }) {
           </thead>
           <tbody>
             {rows.map((person, index) => (
-              <tr key={`${person.Code}-${index}`} className="border-t border-[#eee1cf] bg-white/70">
-                <td className="p-3 font-mono text-[11px] text-[#7d756b]">{person.Code}</td>
-                <td className="p-3 font-bold text-[#173a36]">{person.DisplayName || person.Name}</td>
-                <td className="p-3 text-[#7d756b]">{person.Father}</td>
-                <td className="p-3 text-[#7d756b]">{person.Mother}</td>
-                <td className="p-3 text-[#7d756b]">{person.BranchName}</td>
+              <tr
+                key={`${getPersonCode(person)}-${index}`}
+                onClick={() => navigate("person", { personCode: getPersonCode(person) })}
+                className="cursor-pointer border-t border-[#eee1cf] bg-white/70 hover:bg-[#fbf7f1]"
+              >
+                <td className="p-3 font-mono text-[11px] text-[#7d756b]">{getPersonCode(person)}</td>
+                <td className="p-3 font-bold text-[#173a36]">{getPersonName(person)}</td>
+                <td className="p-3 text-[#7d756b]">{getFatherCode(person)}</td>
+                <td className="p-3 text-[#7d756b]">{getMotherCode(person)}</td>
+                <td className="p-3 text-[#7d756b]">{getBranchName(person)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
     </section>
+  );
+}
+
+function PersonProfilePage({ code, ansabIndex, navigate }) {
+  const person = ansabIndex.peopleByCode[code];
+
+  if (!person) {
+    return (
+      <section className="rounded-[2rem] bg-white/85 p-6 text-center shadow-lg ring-1 ring-black/5">
+        <Database className="mx-auto mb-3 text-[#0a5d52]" size={34} />
+        <h1 className="text-2xl font-black text-[#173a36]">لم يتم العثور على الشخص</h1>
+        <p className="mt-3 text-sm leading-7 text-[#7d756b]">
+          الكود غير موجود في قاعدة البيانات الحالية.
+        </p>
+        <button
+          onClick={() => navigate("ansab")}
+          className="mt-5 rounded-full bg-[#0a5d52] px-6 py-3 text-sm font-bold text-white"
+        >
+          العودة إلى الأنساب
+        </button>
+      </section>
+    );
+  }
+
+  const personCode = getPersonCode(person);
+  const fatherCode = getFatherCode(person);
+  const motherCode = getMotherCode(person);
+
+  const father = ansabIndex.peopleByCode[fatherCode];
+  const mother = ansabIndex.peopleByCode[motherCode];
+
+  const fatherChildren = ansabIndex.childrenByFatherCode[personCode] || [];
+  const motherChildren = ansabIndex.childrenByMotherCode[personCode] || [];
+  const allChildren = [...fatherChildren, ...motherChildren].filter(
+    (child, index, arr) =>
+      arr.findIndex((x) => getPersonCode(x) === getPersonCode(child)) === index
+  );
+
+  const media = ansabIndex.mediaByPersonCode[personCode] || [];
+  const fatherPath = buildFatherPath(person, ansabIndex);
+
+  return (
+    <div className="space-y-5">
+      <section className="rounded-[2rem] bg-[#006b5b] p-6 text-white shadow-xl">
+        <p className="text-sm text-white/70">Person Profile</p>
+        <h1 className="mt-2 text-3xl font-black">
+          {getPersonName(person) || personCode}
+        </h1>
+        <p className="mt-2 font-mono text-xs text-white/70" dir="ltr">
+          {personCode}
+        </p>
+
+        <div className="mt-4 rounded-2xl bg-white/10 p-3 text-sm leading-7">
+          <p>{firstValue(person, ["PersonType"]) || "لا يوجد وصف نوع الشخص بعد."}</p>
+          <p className="mt-1 text-white/70">
+            {getBranchName(person) || "لم يتم تحديد الفرع"}
+          </p>
+        </div>
+      </section>
+
+      <section className="rounded-[1.7rem] bg-white/85 p-4 shadow-lg ring-1 ring-black/5">
+        <h2 className="mb-3 text-xl font-black text-[#006b5b]">الأب والأم</h2>
+
+        <div className="grid grid-cols-1 gap-3">
+          <RelativeButton
+            label="الأب"
+            person={father}
+            fallbackCode={fatherCode}
+            navigate={navigate}
+          />
+          <RelativeButton
+            label="الأم"
+            person={mother}
+            fallbackCode={motherCode}
+            navigate={navigate}
+          />
+        </div>
+      </section>
+
+      <section className="rounded-[1.7rem] bg-white/85 p-4 shadow-lg ring-1 ring-black/5">
+        <h2 className="mb-3 text-xl font-black text-[#006b5b]">المسار صعودًا</h2>
+
+        {fatherPath.length ? (
+          <div className="space-y-2">
+            {fatherPath.map((item, index) => (
+              <button
+                key={getPersonCode(item)}
+                onClick={() =>
+                  navigate("person", { personCode: getPersonCode(item) })
+                }
+                className="flex w-full items-center justify-between rounded-2xl bg-[#fbf7f1] px-4 py-3 text-right"
+              >
+                <span>
+                  <span className="block font-bold text-[#173a36]">
+                    {getPersonName(item)}
+                  </span>
+                  <span className="font-mono text-[11px] text-[#8b8378]" dir="ltr">
+                    {getPersonCode(item)}
+                  </span>
+                </span>
+                <span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-[#006b5b]">
+                  {index === 0 ? "الحالي" : `↑ ${index}`}
+                </span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-[#7d756b]">لا يوجد مسار أبوي محسوب.</p>
+        )}
+      </section>
+
+      <section className="rounded-[1.7rem] bg-white/85 p-4 shadow-lg ring-1 ring-black/5">
+        <h2 className="mb-3 text-xl font-black text-[#006b5b]">
+          الأبناء ({allChildren.length})
+        </h2>
+
+        {allChildren.length ? (
+          <div className="space-y-2">
+            {allChildren.slice(0, 60).map((child) => (
+              <button
+                key={getPersonCode(child)}
+                onClick={() =>
+                  navigate("person", { personCode: getPersonCode(child) })
+                }
+                className="flex w-full items-center justify-between rounded-2xl bg-[#fbf7f1] px-4 py-3 text-right"
+              >
+                <span>
+                  <span className="block font-bold text-[#173a36]">
+                    {getPersonName(child)}
+                  </span>
+                  <span className="font-mono text-[11px] text-[#8b8378]" dir="ltr">
+                    {getPersonCode(child)}
+                  </span>
+                </span>
+                <ChevronLeft size={18} className="text-[#8b8378]" />
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-[#7d756b]">لا يوجد أبناء مربوطون بهذا الكود.</p>
+        )}
+      </section>
+
+      <section className="rounded-[1.7rem] bg-white/85 p-4 shadow-lg ring-1 ring-black/5">
+        <h2 className="mb-3 text-xl font-black text-[#006b5b]">الصور والمرفقات</h2>
+
+        {media.length ? (
+          <div className="grid grid-cols-2 gap-3">
+            {media.map((item, index) => (
+              <div key={index} className="rounded-2xl bg-[#fbf7f1] p-2">
+                <img
+                  src={item.path || item.FileName || item.fileName}
+                  alt={item.caption || "media"}
+                  className="h-28 w-full rounded-xl object-cover"
+                />
+                <p className="mt-2 text-xs font-bold text-[#173a36]">
+                  {item.caption || item.Caption || "صورة مرتبطة"}
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm leading-7 text-[#7d756b]">
+            لم يتم رفع صور لهذا الشخص بعد. لاحقًا اربط الصورة باستخدام نفس الكود:
+            <span className="mx-1 font-mono" dir="ltr">{personCode}</span>
+          </p>
+        )}
+      </section>
+
+      <section className="rounded-[1.7rem] bg-white/85 p-4 shadow-lg ring-1 ring-black/5">
+        <h2 className="mb-3 text-xl font-black text-[#006b5b]">بيانات خام للمراجعة</h2>
+
+        <div className="max-h-[360px] overflow-auto rounded-2xl border border-[#eee1cf]">
+          <table className="w-full text-xs">
+            <tbody>
+              {Object.entries(person).map(([key, value]) => (
+                <tr key={key} className="border-b border-[#eee1cf]">
+                  <td className="w-32 bg-[#f7f1e8] p-2 font-bold text-[#173a36]">
+                    {key}
+                  </td>
+                  <td className="p-2 text-[#7d756b]">{String(value ?? "")}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function RelativeButton({ label, person, fallbackCode, navigate }) {
+  if (!person) {
+    return (
+      <div className="rounded-2xl bg-[#fbf7f1] px-4 py-3">
+        <p className="text-xs font-bold text-[#8b8378]">{label}</p>
+        <p className="mt-1 text-sm text-[#7d756b]">
+          {fallbackCode || "غير محدد"}
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={() => navigate("person", { personCode: getPersonCode(person) })}
+      className="flex w-full items-center justify-between rounded-2xl bg-[#fbf7f1] px-4 py-3 text-right"
+    >
+      <span>
+        <span className="block text-xs font-bold text-[#8b8378]">{label}</span>
+        <span className="block font-bold text-[#173a36]">
+          {getPersonName(person)}
+        </span>
+        <span className="font-mono text-[11px] text-[#8b8378]" dir="ltr">
+          {getPersonCode(person)}
+        </span>
+      </span>
+      <ChevronLeft size={18} className="text-[#8b8378]" />
+    </button>
   );
 }
 
